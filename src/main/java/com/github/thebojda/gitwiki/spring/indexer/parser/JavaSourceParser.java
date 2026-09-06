@@ -4,15 +4,17 @@ import com.github.javaparser.JavaParser;
 import com.github.javaparser.ParseResult;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Modifier;
 import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.AnnotationDeclaration;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.EnumDeclaration;
-import com.github.javaparser.ast.body.FieldDeclaration;
+import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.RecordDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
-import com.github.javaparser.ast.body.VariableDeclarator;
-import com.github.thebojda.gitwiki.spring.indexer.model.FieldModel;
+import com.github.thebojda.gitwiki.spring.indexer.analyzer.SpringRoleAnalyzer;
+import com.github.thebojda.gitwiki.spring.indexer.model.ConstructorModel;
 import com.github.thebojda.gitwiki.spring.indexer.model.JavaFileModel;
 import com.github.thebojda.gitwiki.spring.indexer.model.MethodModel;
 import com.github.thebojda.gitwiki.spring.indexer.model.TypeModel;
@@ -26,12 +28,14 @@ import java.util.List;
 public class JavaSourceParser {
 
     private final JavaParser javaParser;
+    private final SpringRoleAnalyzer springRoleAnalyzer;
 
     public JavaSourceParser() {
         ParserConfiguration configuration = new ParserConfiguration()
                 .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_17);
 
         this.javaParser = new JavaParser(configuration);
+        this.springRoleAnalyzer = new SpringRoleAnalyzer();
     }
 
     public JavaFileModel parse(Path projectRoot, Path sourceFile) throws IOException {
@@ -74,8 +78,30 @@ public class JavaSourceParser {
                 .sorted()
                 .toList();
 
-        List<FieldModel> fields = parseFields(type);
+        List<String> extendedTypes = List.of();
+        List<String> implementedTypes = List.of();
+
+        if (type instanceof ClassOrInterfaceDeclaration declaration) {
+            extendedTypes = declaration
+                    .getExtendedTypes()
+                    .stream()
+                    .map(Object::toString)
+                    .sorted()
+                    .toList();
+
+            implementedTypes = declaration
+                    .getImplementedTypes()
+                    .stream()
+                    .map(Object::toString)
+                    .sorted()
+                    .toList();
+        }
+
+        List<ConstructorModel> constructors = parseConstructors(type);
+        List<String> dependencies = parseDependencies(type);
         List<MethodModel> methods = parseMethods(type);
+
+        String springRole = springRoleAnalyzer.detectRole(type);
 
         return new TypeModel(
                 type.getNameAsString(),
@@ -83,60 +109,55 @@ public class JavaSourceParser {
                 getBeginLine(type),
                 getEndLine(type),
                 annotations,
-                fields,
+                extendedTypes,
+                implementedTypes,
+                springRole,
+                dependencies,
+                constructors,
                 methods
         );
     }
 
-    private List<FieldModel> parseFields(TypeDeclaration<?> type) {
-        List<FieldModel> result = new ArrayList<>();
+    private List<String> parseDependencies(TypeDeclaration<?> type) {
+        List<String> dependencies = new ArrayList<>();
 
-        for (FieldDeclaration field : type.getFields()) {
-
-            List<String> annotations = field
-                    .getAnnotations()
-                    .stream()
-                    .map(Object::toString)
-                    .sorted()
-                    .toList();
-
-            for (VariableDeclarator variable : field.getVariables()) {
-
-                String modifiers = field
-                        .getModifiers()
-                        .stream()
-                        .map(modifier -> modifier.getKeyword().asString())
-                        .reduce(
-                                "",
-                                (left, right) -> left + right + " "
-                        );
-
-                String declaration =
-                        modifiers
-                                + variable.getTypeAsString()
-                                + " "
-                                + variable.getNameAsString()
-                                + variable.getInitializer()
-                                .map(initializer -> " = " + initializer)
-                                .orElse("")
-                                + ";";
-
-                result.add(
-                        new FieldModel(
-                                variable.getNameAsString(),
-                                variable.getTypeAsString(),
-                                declaration.trim(),
-                                getBeginLine(field),
-                                getEndLine(field),
-                                annotations
-                        )
-                );
+        for (ConstructorDeclaration constructor : type.getConstructors()) {
+            if (!isPublicOrProtected(constructor)) {
+                continue;
             }
+
+            constructor.getParameters().forEach(parameter ->
+                    dependencies.add(parameter.getTypeAsString())
+            );
         }
 
-        return result
+        return dependencies
                 .stream()
-                .sorted(Comparator.comparing(FieldModel::name))
+                .distinct()
+                .sorted()
+                .toList();
+    }
+
+    private List<ConstructorModel> parseConstructors(TypeDeclaration<?> type) {
+        return type
+                .getConstructors()
+                .stream()
+                .filter(this::isPublicOrProtected)
+                .map(constructor -> new ConstructorModel(
+                        constructor.getDeclarationAsString(
+                                true,
+                                true,
+                                true
+                        ),
+                        getBeginLine(constructor),
+                        getEndLine(constructor),
+                        constructor.getAnnotations()
+                                .stream()
+                                .map(Object::toString)
+                                .sorted()
+                                .toList()
+                ))
+                .sorted(Comparator.comparing(ConstructorModel::signature))
                 .toList();
     }
 
@@ -144,6 +165,7 @@ public class JavaSourceParser {
         return type
                 .getMethods()
                 .stream()
+                .filter(this::isPublicOrProtected)
                 .map(method -> new MethodModel(
                         method.getNameAsString(),
                         method.getDeclarationAsString(
@@ -166,6 +188,16 @@ public class JavaSourceParser {
                                 .thenComparing(MethodModel::signature)
                 )
                 .toList();
+    }
+
+    private boolean isPublicOrProtected(MethodDeclaration method) {
+        return method.hasModifier(Modifier.Keyword.PUBLIC)
+                || method.hasModifier(Modifier.Keyword.PROTECTED);
+    }
+
+    private boolean isPublicOrProtected(ConstructorDeclaration constructor) {
+        return constructor.hasModifier(Modifier.Keyword.PUBLIC)
+                || constructor.hasModifier(Modifier.Keyword.PROTECTED);
     }
 
     private String getTypeKind(TypeDeclaration<?> type) {

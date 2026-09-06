@@ -8,7 +8,11 @@ public record TypeModel(
         int beginLine,
         int endLine,
         List<String> annotations,
-        List<FieldModel> fields,
+        List<String> extendedTypes,
+        List<String> implementedTypes,
+        String springRole,
+        List<String> dependencies,
+        List<ConstructorModel> constructors,
         List<MethodModel> methods
 ) {
 }
